@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 客廳模擬圖</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #f0f0f0; font-family: sans-serif; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: #333;
+            background: rgba(255,255,255,0.8);
+            padding: 10px;
+            pointer-events: none;
+            font-size: 14px;
+        }
+    </style>
+    <!-- Import Three.js from CDN -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info">
+        <strong>客廳 3D 示意圖</strong><br>
+        左鍵旋轉 | 滾輪縮放 | 右鍵平移<br>
+        基於您的 PDF 手繪稿生成
+    </div>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- 場景設置 ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xe0e0e0);
+        // 添加一些霧氣效果，增加深度感
+        scene.fog = new THREE.Fog(0xe0e0e0, 10, 50);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 12, 12); // 俯視角度
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true; // 啟用陰影
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- 控制器 ---
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.maxPolarAngle = Math.PI / 2 - 0.1; // 防止轉到地板下方
+
+        // --- 材質定義 ---
+        const wallMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+        const floorMaterial = new THREE.MeshStandardMaterial({ color: 0xdabb96 }); // 木地板顏色
+        const sofaMaterial = new THREE.MeshStandardMaterial({ color: 0x556b2f }); // 綠色/卡其色沙發
+        const woodMaterial = new THREE.MeshStandardMaterial({ color: 0x8b4513 }); // 深木色
+        const glassMaterial = new THREE.MeshStandardMaterial({ 
+            color: 0xaaddff, 
+            transparent: true, 
+            opacity: 0.6,
+            metalness: 0.1,
+            roughness: 0.1
+        });
+        const lampShadeMaterial = new THREE.MeshStandardMaterial({ color: 0xffffee, emissive: 0x333300 });
+        const blackPlasticMaterial = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.5 });
+        const screenMaterial = new THREE.MeshStandardMaterial({ color: 0x050505, roughness: 0.2, metalness: 0.8 });
+
+        // --- 房間幾何結構 ---
+        // 假設房間大小 5m x 6m
+        const roomWidth = 6;
+        const roomDepth = 8;
+        const wallHeight = 3.5;
+
+        // 地板
+        const floorGeometry = new THREE.PlaneGeometry(roomWidth, roomDepth);
+        const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+        floor.rotation.x = -Math.PI / 2;
+        floor.receiveShadow = true;
+        scene.add(floor);
+
+        // 牆壁 (只建後牆、左牆、右牆，前面開放以便觀看)
+        // const backWallGeo = new THREE.BoxGeometry(roomWidth, wallHeight, 0.2);
+        // const backWall = new THREE.Mesh(backWallGeo, wallMaterial);
+        // backWall.position.set(0, wallHeight/2, -roomDepth/2);
+        // backWall.receiveShadow = true;
+        // scene.add(backWall);
+
+        const sideWallGeo = new THREE.BoxGeometry(0.2, wallHeight, roomDepth);
+        
+        // 左牆 - 補回實體牆面
+        const leftWall = new THREE.Mesh(sideWallGeo, wallMaterial);
+        leftWall.position.set(-roomWidth/2, wallHeight/2, 0);
+        leftWall.receiveShadow = true;
+        scene.add(leftWall);
+
+        // 右牆 (帶門) - 重建右牆以包含門洞
+        function createRightWallWithDoor() {
+            const group = new THREE.Group();
+            const doorWidth = 1.0;
+            const doorHeight = 2.1;
+            // 門的位置：原為 2.5，向下移動 30% (0.3m) -> 2.8
+            const doorZPos = 2.8; 
+            
+            // 計算牆面分段
+            const zStart = -roomDepth/2; // -4
+            const zEnd = roomDepth/2;    // 4
+            const doorMin = doorZPos - doorWidth/2;
+            const doorMax = doorZPos + doorWidth/2;
+            
+            // 1. 後段牆 (窗戶到門)
+            const len1 = doorMin - zStart;
+            const part1Geo = new THREE.BoxGeometry(0.2, wallHeight, len1);
+            const part1 = new THREE.Mesh(part1Geo, wallMaterial);
+            part1.position.set(0, wallHeight/2, zStart + len1/2);
+            part1.receiveShadow = true;
+            group.add(part1);
+            
+            // 2. 前段牆 (門到前緣)
+            const len2 = zEnd - doorMax;
+            if (len2 > 0) {
+                const part2Geo = new THREE.BoxGeometry(0.2, wallHeight, len2);
+                const part2 = new THREE.Mesh(part2Geo, wallMaterial);
+                part2.position.set(0, wallHeight/2, doorMax + len2/2);
+                part2.receiveShadow = true;
+                group.add(part2);
+            }
+            
+            // 3. 門上樑
+            const headerHeight = wallHeight - doorHeight;
+            if (headerHeight > 0) {
+                const headerGeo = new THREE.BoxGeometry(0.2, headerHeight, doorWidth);
+                const header = new THREE.Mesh(headerGeo, wallMaterial);
+                header.position.set(0, doorHeight + headerHeight/2, doorZPos);
+                header.receiveShadow = true;
+                group.add(header);
+            }
+            
+            // 4. 門框
+            const frameMat = new THREE.MeshStandardMaterial({color: 0x5c4033}); // 深褐色
+            // 左右框
+            const vFrameGeo = new THREE.BoxGeometry(0.22, doorHeight, 0.05);
+            const frame1 = new THREE.Mesh(vFrameGeo, frameMat);
+            frame1.position.set(0, doorHeight/2, doorMin);
+            group.add(frame1);
+            
+            const frame2 = new THREE.Mesh(vFrameGeo, frameMat);
+            frame2.position.set(0, doorHeight/2, doorMax);
+            group.add(frame2);
+            // 上框
+            const topFrameGeo = new THREE.BoxGeometry(0.22, 0.05, doorWidth);
+            const topFrame = new THREE.Mesh(topFrameGeo, frameMat);
+            topFrame.position.set(0, doorHeight, doorZPos);
+            group.add(topFrame);
+            
+            // 5. 門板 (修正轉軸位置)
+            const actualDoorWidth = doorWidth - 0.05;
+            const doorGeo = new THREE.BoxGeometry(0.05, doorHeight - 0.02, actualDoorWidth);
+            const doorMat = new THREE.MeshStandardMaterial({color: 0x8b5a2b}); // 木門色
+            const doorMesh = new THREE.Mesh(doorGeo, doorMat);
+            
+            // 建立一個群組作為轉軸 (Pivot Group)
+            const doorPivot = new THREE.Group();
+            
+            // 將轉軸定位在門框的「另一側」 (改為靠近前緣/下方的那一側 doorMax)
+            doorPivot.position.set(0, 0, doorMax); 
+            
+            // 將門板加入轉軸群組
+            // 關鍵：轉軸現在在 Z 軸數值大的一端，門板要往 Z 軸負方向延伸
+            // 所以中心點要設為「負的」一半寬度
+            doorMesh.position.set(0, doorHeight/2, -actualDoorWidth / 2);
+            
+            doorPivot.add(doorMesh);
+            
+            // 旋轉轉軸
+            // 因為轉軸換邊了，為了保持向內開，旋轉角度符號也要改變 (逆時針轉)
+            doorPivot.rotation.y = Math.PI / 3; 
+            
+            group.add(doorPivot);
+
+            group.position.set(roomWidth/2, 0, 0); // 放到房間右側邊緣
+            scene.add(group);
+        }
+        createRightWallWithDoor();
+
+        // 1. 落地窗與後牆 (在後牆上) - 修改為透明玻璃與窗框結構
+        function createWindow() {
+            const group = new THREE.Group();
+            
+            // 窗戶尺寸
+            const winWidth = 4.0;
+            const winHeight = 3.0; // 落地窗較高
+            const wallWidth = roomWidth;
+            
+            // 1. 建立後牆 (挖洞) - 由左、右、上三塊組成
+            // 左邊牆
+            const sideWidth = (wallWidth - winWidth) / 2;
+            const leftBackWallGeo = new THREE.BoxGeometry(sideWidth, wallHeight, 0.2);
+            const leftBackWall = new THREE.Mesh(leftBackWallGeo, wallMaterial);
+            leftBackWall.position.set(-(winWidth/2 + sideWidth/2), wallHeight/2, -roomDepth/2);
+            leftBackWall.receiveShadow = true;
+            group.add(leftBackWall);
+
+            // 右邊牆
+            const rightBackWall = new THREE.Mesh(leftBackWallGeo, wallMaterial);
+            rightBackWall.position.set((winWidth/2 + sideWidth/2), wallHeight/2, -roomDepth/2);
+            rightBackWall.receiveShadow = true;
+            group.add(rightBackWall);
+
+            // 上方牆 (樑)
+            const topHeight = wallHeight - winHeight;
+            if (topHeight > 0) {
+                const topBackWallGeo = new THREE.BoxGeometry(winWidth, topHeight, 0.2);
+                const topBackWall = new THREE.Mesh(topBackWallGeo, wallMaterial);
+                topBackWall.position.set(0, winHeight + topHeight/2, -roomDepth/2);
+                topBackWall.receiveShadow = true;
+                group.add(topBackWall);
+            }
+
+            // 2. 透明落地窗玻璃
+            const glassGeo = new THREE.PlaneGeometry(winWidth, winHeight);
+            const glassMesh = new THREE.Mesh(glassGeo, glassMaterial); // 使用定義好的透明材質
+            glassMesh.position.set(0, winHeight/2, -roomDepth/2 + 0.05);
+            // 雙面渲染以便從外面也能看到
+            glassMesh.material.side = THREE.DoubleSide;
+            group.add(glassMesh);
+            
+            // 3. 落地窗框
+            // 外框
+            const frameThickness = 0.1;
+            const frameDepth = 0.15;
+            // 上下框
+            const hFrameGeo = new THREE.BoxGeometry(winWidth, frameThickness, frameDepth);
+            const topFrame = new THREE.Mesh(hFrameGeo, new THREE.MeshStandardMaterial({color: 0x333333})); // 深色窗框
+            topFrame.position.set(0, winHeight - frameThickness/2, -roomDepth/2 + 0.05);
+            group.add(topFrame);
+            
+            const bottomFrame = new THREE.Mesh(hFrameGeo, new THREE.MeshStandardMaterial({color: 0x333333}));
+            bottomFrame.position.set(0, frameThickness/2, -roomDepth/2 + 0.05);
+            group.add(bottomFrame);
+
+            // 左右框
+            const vFrameGeo = new THREE.BoxGeometry(frameThickness, winHeight, frameDepth);
+            const leftFrame = new THREE.Mesh(vFrameGeo, new THREE.MeshStandardMaterial({color: 0x333333}));
+            leftFrame.position.set(-winWidth/2 + frameThickness/2, winHeight/2, -roomDepth/2 + 0.05);
+            group.add(leftFrame);
+
+            const rightFrame = new THREE.Mesh(vFrameGeo, new THREE.MeshStandardMaterial({color: 0x333333}));
+            rightFrame.position.set(winWidth/2 - frameThickness/2, winHeight/2, -roomDepth/2 + 0.05);
+            group.add(rightFrame);
+
+            // 中間分隔框 (落地窗常見設計)
+            const midFrame = new THREE.Mesh(vFrameGeo, new THREE.MeshStandardMaterial({color: 0x333333}));
+            midFrame.position.set(0, winHeight/2, -roomDepth/2 + 0.05);
+            group.add(midFrame);
+
+            // 4. 外景 (簡單的天空背景平面，避免窗戶看出去是全灰)
+            const skyGeo = new THREE.PlaneGeometry(15, 10);
+            const skyMat = new THREE.MeshBasicMaterial({ color: 0x87CEEB }); // 天空藍
+            const skyPlane = new THREE.Mesh(skyGeo, skyMat);
+            skyPlane.position.set(0, 5, -roomDepth/2 - 2); // 放在窗戶外面一段距離
+            group.add(skyPlane);
+
+            scene.add(group);
+        }
+
+        // 2. 沙發 (左側) - PDF上的 "SOFA"
+        function createSofa() {
+            const sofaGroup = new THREE.Group();
+            
+            // 底座
+            const baseGeo = new THREE.BoxGeometry(1.5, 0.5, 4);
+            const base = new THREE.Mesh(baseGeo, sofaMaterial);
+            base.position.y = 0.25;
+            base.castShadow = true;
+            base.receiveShadow = true;
+            sofaGroup.add(base);
+
+            // 靠背
+            const backGeo = new THREE.BoxGeometry(0.3, 1, 4);
+            const back = new THREE.Mesh(backGeo, sofaMaterial);
+            back.position.set(-0.6, 0.75, 0); // 靠左牆
+            back.castShadow = true;
+            sofaGroup.add(back);
+
+            // 扶手 (上下兩端)
+            const armGeo = new THREE.BoxGeometry(1.5, 0.8, 0.3);
+            const arm1 = new THREE.Mesh(armGeo, sofaMaterial);
+            arm1.position.set(0, 0.4, 1.85);
+            arm1.castShadow = true;
+            sofaGroup.add(arm1);
+
+            const arm2 = new THREE.Mesh(armGeo, sofaMaterial);
+            arm2.position.set(0, 0.4, -1.85);
+            arm2.castShadow = true;
+            sofaGroup.add(arm2);
+
+            // 放置位置：左側牆邊
+            sofaGroup.position.set(-roomWidth/2 + 1, 0, -1); 
+            scene.add(sofaGroup);
+        }
+
+        // 3. 電視櫃與電視 (右側) - PDF上的 "電視櫃" & "television"
+        function createTVArea() {
+            const group = new THREE.Group();
+
+            // 電視櫃 (長條形)
+            const cabinetGeo = new THREE.BoxGeometry(1, 0.6, 5); // 稍微做一點曲線感覺太複雜，用長方形代替
+            const cabinet = new THREE.Mesh(cabinetGeo, woodMaterial);
+            cabinet.position.y = 0.3;
+            cabinet.castShadow = true;
+            cabinet.receiveShadow = true;
+            group.add(cabinet);
+
+            // 電視 (薄板)
+            const tvGeo = new THREE.BoxGeometry(0.1, 1, 1.8);
+            const tv = new THREE.Mesh(tvGeo, blackPlasticMaterial);
+            tv.position.set(0, 0.6 + 0.5, 0); // 在櫃子上
+            tv.castShadow = true;
+            
+            // 螢幕面
+            const screenGeo = new THREE.PlaneGeometry(1.7, 0.9);
+            const screen = new THREE.Mesh(screenGeo, screenMaterial);
+            screen.position.set(-0.06, 0.6 + 0.5, 0);
+            screen.rotation.y = -Math.PI / 2;
+
+            group.add(tv);
+            group.add(screen);
+
+            // 放置位置：右側牆邊
+            group.position.set(roomWidth/2 - 0.8, 0, -0.5);
+            scene.add(group);
+        }
+
+        // 4. 矮桌 (中間) - PDF上有兩個圓形 "矮桌"
+        function createTables() {
+            // 桌子 1
+            const tableGeo = new THREE.CylinderGeometry(0.6, 0.5, 0.4, 32);
+            const table1 = new THREE.Mesh(tableGeo, woodMaterial);
+            table1.position.set(-0.5, 0.2, -1.5);
+            table1.castShadow = true;
+            table1.receiveShadow = true;
+            scene.add(table1);
+
+            // 桌子 2
+            const table2 = new THREE.Mesh(tableGeo, woodMaterial);
+            table2.position.set(-0.5, 0.2, 0.5);
+            table2.castShadow = true;
+            table2.receiveShadow = true;
+            scene.add(table2);
+        }
+
+        // 5. 落地燈 (左下角) - PDF上的 "落地燈"
+        function createLamp() {
+            const lampGroup = new THREE.Group();
+
+            // 底座
+            const baseGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.05, 32);
+            const base = new THREE.Mesh(baseGeo, blackPlasticMaterial);
+            lampGroup.add(base);
+
+            // 燈桿
+            const poleGeo = new THREE.CylinderGeometry(0.05, 0.05, 2.5, 16);
+            const pole = new THREE.Mesh(poleGeo, blackPlasticMaterial);
+            pole.position.y = 1.25;
+            lampGroup.add(pole);
+
+            // 燈罩
+            const shadeGeo = new THREE.ConeGeometry(0.4, 0.5, 32, 1, true);
+            const shade = new THREE.Mesh(shadeGeo, lampShadeMaterial);
+            shade.position.set(0, 2.3, 0);
+            lampGroup.add(shade);
+
+            // 實際光源 (燈泡)
+            const bulbLight = new THREE.PointLight(0xffaa00, 10, 5);
+            bulbLight.position.set(0, 2.2, 0);
+            bulbLight.castShadow = true;
+            lampGroup.add(bulbLight);
+
+            // 放置位置：左下角
+            lampGroup.position.set(-roomWidth/2 + 1, 0, roomDepth/2 - 1.5);
+            scene.add(lampGroup);
+        }
+
+        // 執行創建函數
+        createWindow();
+        createSofa();
+        createTVArea();
+        createTables();
+        createLamp();
+
+        // --- 燈光設置 ---
+        // 環境光 (整體亮度)
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+
+        // 來自窗戶的定向光
+        const sunLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        sunLight.position.set(2, 5, -5);
+        sunLight.castShadow = true;
+        // 優化陰影品質
+        sunLight.shadow.mapSize.width = 1024;
+        sunLight.shadow.mapSize.height = 1024;
+        scene.add(sunLight);
+
+        // 天花板補光
+        const ceilingLight = new THREE.PointLight(0xffffff, 0.5, 10);
+        ceilingLight.position.set(0, 4, 0);
+        scene.add(ceilingLight);
+
+        // --- 動畫循環 ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        
+        // 處理視窗大小改變
+        window.addEventListener('resize', onWindowResize, false);
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

@@ -1,0 +1,996 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Snowy Forest Screensaver · Christmas</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #05070f; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    .hint {
+      position: fixed; left: 12px; bottom: 12px;
+      color: rgba(255,255,255,0.7);
+      font: 12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      user-select: none; pointer-events: none;
+      text-shadow: 0 1px 8px rgba(0,0,0,0.7);
+    }
+    .hidden { opacity: 0; transition: opacity 600ms ease; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hint" class="hint">Click 切換提示 · L 燈飾 · S 雪橇 · R 重置積雪 · Esc 停止</div>
+
+  <script>
+    // Snowy Forest Screensaver (Christmas Edition)
+    // - Random snowflakes fall with wind
+    // - Snow accumulates and slowly rises (height map)
+    // - Taller trees + Christmas lights ambience
+    // - Occasional Santa sleigh fly-by
+
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const hint = document.getElementById('hint');
+
+    let running = true;
+    let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+    // Tunables
+    const CONFIG = {
+      flakesPerSecond: 130,
+      maxFlakes: 900,
+      windStrength: 0.95,
+      gravityMin: 0.52,              // px/frame at 60fps (scaled)
+      gravityMax: 1.95,
+
+      groundBinSize: 3,
+      maxSnowDepth: 420,             // higher cap so the ground can keep rising
+      accumulationPerHit: [0.16, 0.55],
+
+      smoothIterationsPerFrame: 1,
+      avalancheIterationsPerFrame: 1,
+      slopeLimit: 10,                // bin height diff threshold
+
+      treeLayers: 3,
+      christmasLights: true,
+      sleighEnabled: true,
+
+      // Sleigh timing (seconds)
+      sleighIntervalMin: 22,
+      sleighIntervalMax: 46,
+    };
+
+    const state = {
+      w: 0, h: 0,
+      t: 0,
+      last: performance.now(),
+
+      wind: 0,
+      windTarget: 0,
+      windTimer: 0,
+
+      flakes: [],
+      sparks: [],
+
+      snowBins: new Float32Array(1),
+      bins: 1,
+      groundY: 0,
+
+      trees: [],
+      fairy: [],
+      stars: [],
+
+      sleigh: null,
+      sleighTimer: 0,
+      sleighTrail: [],
+
+      hintVisible: true,
+    };
+
+    function rand(a, b) { return a + Math.random() * (b - a); }
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+    function lerp(a, b, t) { return a + (b - a) * t; }
+
+    function resize() {
+      dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      state.w = Math.floor(window.innerWidth);
+      state.h = Math.floor(window.innerHeight);
+
+      canvas.width = Math.floor(state.w * dpr);
+      canvas.height = Math.floor(state.h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      // Lower ground a bit to emphasize snow rising over time
+      state.groundY = Math.floor(state.h * 0.88);
+
+      state.bins = Math.max(8, Math.ceil(state.w / CONFIG.groundBinSize));
+      // Preserve existing snow when resizing by resampling
+      const old = state.snowBins;
+      const oldBins = old.length;
+      state.snowBins = new Float32Array(state.bins);
+      if (oldBins > 1) {
+        for (let i = 0; i < state.bins; i++) {
+          const u = i / Math.max(1, state.bins - 1);
+          const j = u * (oldBins - 1);
+          const j0 = Math.floor(j);
+          const j1 = Math.min(oldBins - 1, j0 + 1);
+          const t = j - j0;
+          state.snowBins[i] = lerp(old[j0], old[j1], t);
+        }
+      }
+
+      buildStars();
+      buildForest();
+      buildFairyLights();
+
+      // Reset sleigh timer on resize for nicer pacing
+      state.sleighTimer = rand(CONFIG.sleighIntervalMin, CONFIG.sleighIntervalMax);
+    }
+
+    function buildStars() {
+      // Starfield for Christmas-night vibe
+      const n = Math.floor(clamp(state.w * state.h / 9000, 120, 260));
+      state.stars = [];
+      for (let i = 0; i < n; i++) {
+        const x = Math.random() * state.w;
+        const y = Math.random() * state.h * 0.55;
+        const r = rand(0.4, 1.5);
+        const tw = rand(0, Math.PI * 2);
+        const sp = rand(0.6, 1.6);
+        state.stars.push({ x, y, r, tw, sp });
+      }
+    }
+
+    function buildForest() {
+      state.trees = [];
+
+      const layerCount = clamp(CONFIG.treeLayers, 1, 3);
+      const layers = [];
+      for (let i = 0; i < layerCount; i++) {
+        const depth = i / Math.max(1, layerCount - 1); // 0..1
+        const count = Math.max(3, Math.floor(lerp(28, 11, depth) * 0.8));
+        layers.push({ depth, count });
+      }
+
+      for (const layer of layers) {
+        for (let i = 0; i < layer.count; i++) {
+          const x = rand(-0.12, 1.12) * state.w;
+          const baseY = state.groundY + rand(-14, 22);
+
+          // Taller trees
+          const height = lerp(560, 260, layer.depth) * rand(0.78, 1.18) * 0.8;
+          const spread = lerp(140, 55, layer.depth) * rand(0.75, 1.25);
+
+          const tilt = rand(-0.06, 0.06);
+          const seed = Math.random() * 9999;
+          const kind = Math.random() < 0.72 ? 'pine' : 'bare';
+
+          state.trees.push({ x, baseY, height, spread, tilt, depth: layer.depth, seed, kind });
+        }
+      }
+
+      state.trees.sort((a, b) => a.depth - b.depth);
+    }
+
+    function buildFairyLights() {
+      // Small warm & colorful dots near the tree line
+      state.fairy = [];
+      const n = Math.floor(clamp(state.w / 10, 90, 170));
+      for (let i = 0; i < n; i++) {
+        const x = Math.random() * state.w;
+        const y = rand(state.h * 0.42, state.groundY - 30);
+        const depth = Math.random();
+        const r = lerp(0.6, 2.2, 1 - depth);
+        const tw = rand(0, Math.PI * 2);
+        const sp = rand(0.7, 2.3);
+        const palette = ['#ff3b3b', '#31d158', '#ffd60a', '#64d2ff', '#ffffff'];
+        const color = palette[Math.floor(Math.random() * palette.length)];
+        const intensity = lerp(0.18, 0.62, 1 - depth);
+        state.fairy.push({ x, y, depth, r, tw, sp, color, intensity });
+      }
+    }
+
+    function resetSnow() {
+      state.snowBins.fill(0);
+      state.flakes.length = 0;
+      state.sparks.length = 0;
+      state.sleighTrail.length = 0;
+    }
+
+    function spawnFlake(dt) {
+      if (state.flakes.length >= CONFIG.maxFlakes) return;
+
+      // 3 depth bands
+      const band = Math.random() < 0.18 ? 0 : (Math.random() < 0.55 ? 1 : 2);
+      const depth = band / 2;
+
+      const size = lerp(1.1, 3.4, 1 - depth) * rand(0.72, 1.18);
+      const x = rand(-0.06, 1.06) * state.w;
+      const y = rand(-55, -12);
+
+      const vy = lerp(CONFIG.gravityMax, CONFIG.gravityMin, depth) * rand(0.75, 1.1);
+      const drift = rand(-0.6, 0.6) * lerp(0.55, 1.05, 1 - depth);
+      const tw = rand(0.6, 1.6);
+
+      state.flakes.push({ x, y, size, vy, drift, tw, depth, life: 0 });
+    }
+
+    function updateWind(dt) {
+      state.windTimer -= dt;
+      if (state.windTimer <= 0) {
+        state.windTimer = rand(1.4, 3.0);
+        state.windTarget = rand(-1, 1) * CONFIG.windStrength;
+      }
+      state.wind = lerp(state.wind, state.windTarget, 1 - Math.pow(0.001, dt));
+    }
+
+    function groundAt(x) {
+      const bin = clamp(Math.floor(x / CONFIG.groundBinSize), 0, state.bins - 1);
+      return { bin, y: state.groundY - state.snowBins[bin] };
+    }
+
+    function depositSnow(bin, amount) {
+      // Deposit and spread a bit to neighbors for a softer pile
+      const b0 = bin;
+      const a0 = amount;
+      const a1 = amount * 0.72;
+      const a2 = amount * 0.42;
+
+      const bins = state.snowBins;
+      bins[b0] = clamp(bins[b0] + a0, 0, CONFIG.maxSnowDepth);
+      if (b0 - 1 >= 0) bins[b0 - 1] = clamp(bins[b0 - 1] + a1, 0, CONFIG.maxSnowDepth);
+      if (b0 + 1 < state.bins) bins[b0 + 1] = clamp(bins[b0 + 1] + a1, 0, CONFIG.maxSnowDepth);
+      if (b0 - 2 >= 0) bins[b0 - 2] = clamp(bins[b0 - 2] + a2, 0, CONFIG.maxSnowDepth);
+      if (b0 + 2 < state.bins) bins[b0 + 2] = clamp(bins[b0 + 2] + a2, 0, CONFIG.maxSnowDepth);
+    }
+
+    function smoothSnow() {
+      // Gentle diffusion (keeps it looking natural while still rising)
+      const bins = state.snowBins;
+      for (let k = 0; k < CONFIG.smoothIterationsPerFrame; k++) {
+        let prev = bins[0];
+        for (let i = 1; i < bins.length - 1; i++) {
+          const cur = bins[i];
+          const next = bins[i + 1];
+          const avg = (prev + cur + next) / 3;
+          bins[i] = lerp(cur, avg, 0.18);
+          prev = cur;
+        }
+      }
+    }
+
+    function avalancheSnow() {
+      // Simple slope-limited redistribution so piles look stable but still accumulate
+      const bins = state.snowBins;
+      const limit = CONFIG.slopeLimit;
+      for (let it = 0; it < CONFIG.avalancheIterationsPerFrame; it++) {
+        for (let i = 0; i < bins.length - 1; i++) {
+          const a = bins[i];
+          const b = bins[i + 1];
+          const d = a - b;
+          if (d > limit) {
+            const move = d * 0.12;
+            bins[i] = a - move;
+            bins[i + 1] = clamp(b + move, 0, CONFIG.maxSnowDepth);
+          } else if (d < -limit) {
+            const move = (-d) * 0.12;
+            bins[i] = clamp(a + move, 0, CONFIG.maxSnowDepth);
+            bins[i + 1] = b - move;
+          }
+        }
+      }
+    }
+
+    function maybeSpawnSleigh(dt) {
+      if (!CONFIG.sleighEnabled) return;
+
+      state.sleighTimer -= dt;
+      if (state.sleighTimer > 0) return;
+
+      // Spawn a new fly-by
+      state.sleighTimer = rand(CONFIG.sleighIntervalMin, CONFIG.sleighIntervalMax);
+
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      const y = rand(state.h * 0.12, state.h * 0.28);
+      const speed = rand(260, 420) * dir; // px/s
+
+      const x = dir > 0 ? -220 : state.w + 220;
+      const wobble = rand(0.6, 1.4);
+
+      state.sleigh = { x, y, speed, dir, t: 0, wobble };
+      state.sleighTrail = [];
+    }
+
+    function updateSleigh(dt) {
+      const s = state.sleigh;
+      if (!s) return;
+
+      s.t += dt;
+      s.x += s.speed * dt;
+      s.y += Math.sin(s.t * 2.1) * s.wobble * 0.6;
+
+      // Trail points for tail glow
+      state.sleighTrail.push({ x: s.x + 18, y: s.y - 2, t: state.t });
+      for (let i = state.sleighTrail.length - 1; i >= 0; i--) {
+        if (state.t - state.sleighTrail[i].t > 1.25) state.sleighTrail.splice(i, 1);
+      }
+      if (state.sleighTrail.length > 90) state.sleighTrail.splice(0, state.sleighTrail.length - 90);
+
+      // Sparkles behind sleigh
+      if (Math.random() < 0.35) {
+        const sx = s.x - s.dir * 16;
+        const sy = s.y + rand(-6, 6);
+        const svx = -s.dir * rand(40, 90);
+        const svy = rand(-10, 10);
+        const life = rand(0.6, 1.2);
+        const size = rand(0.8, 1.8);
+        const palette = ['#ffd60a', '#ffffff', '#64d2ff', '#ff3b3b', '#31d158'];
+        const color = palette[(Math.random() * palette.length) | 0];
+        state.sparks.push({ x: sx, y: sy, vx: svx, vy: svy, life, age: 0, size, color });
+      }
+
+      // Despawn when off-screen
+      if ((s.dir > 0 && s.x > state.w + 240) || (s.dir < 0 && s.x < -240)) {
+        state.sleigh = null;
+      }
+    }
+
+    function updateSparks(dt) {
+      for (let i = state.sparks.length - 1; i >= 0; i--) {
+        const p = state.sparks[i];
+        p.age += dt;
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vy += 18 * dt;
+        if (p.age >= p.life) state.sparks.splice(i, 1);
+      }
+      // Safety cap
+      if (state.sparks.length > 500) state.sparks.splice(0, state.sparks.length - 500);
+    }
+
+    function update(dt) {
+      updateWind(dt);
+
+      // Spawn snow according to dt
+      const toSpawn = CONFIG.flakesPerSecond * dt;
+      const n = Math.floor(toSpawn);
+      const frac = toSpawn - n;
+      for (let i = 0; i < n; i++) spawnFlake(dt);
+      if (Math.random() < frac) spawnFlake(dt);
+
+      const wind = state.wind;
+
+      // Update flakes
+      for (let i = state.flakes.length - 1; i >= 0; i--) {
+        const f = state.flakes[i];
+        f.life += dt;
+
+        const wobble = Math.sin((f.life * 2.2) + f.tw) * 0.35;
+        const vx = (f.drift + wobble) + wind * lerp(0.4, 1.25, 1 - f.depth);
+
+        f.x += vx * 60 * dt;
+        f.y += f.vy * 60 * dt;
+
+        // Wrap horizontally
+        if (f.x < -50) f.x = state.w + 50;
+        if (f.x > state.w + 50) f.x = -50;
+
+        // Ground collision -> deposit
+        const g = groundAt(f.x);
+        if (f.y + f.size >= g.y) {
+          // Smaller per-hit, but persistent; visible slow rising over time
+          const dep = rand(CONFIG.accumulationPerHit[0], CONFIG.accumulationPerHit[1]) * Math.pow(f.size, 1.15);
+          depositSnow(g.bin, dep);
+          state.flakes.splice(i, 1);
+          continue;
+        }
+
+        // Cull if it escapes
+        if (f.y > state.h + 110) state.flakes.splice(i, 1);
+      }
+
+      smoothSnow();
+      avalancheSnow();
+
+      maybeSpawnSleigh(dt);
+      updateSleigh(dt);
+      updateSparks(dt);
+    }
+
+    function drawSky() {
+      // Night sky with a subtle holiday glow
+      const g = ctx.createLinearGradient(0, 0, 0, state.h);
+      g.addColorStop(0.0, '#051028');
+      g.addColorStop(0.55, '#0a1637');
+      g.addColorStop(1.0, '#070a12');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, state.w, state.h);
+
+      // Stars
+      for (const s of state.stars) {
+        const tw = 0.55 + 0.45 * Math.sin(state.t * s.sp + s.tw);
+        ctx.globalAlpha = 0.22 + 0.55 * tw;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.r * tw, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      // Moon (brighter)
+      const mx = state.w * 0.82;
+      const my = state.h * 0.16;
+      const mr = Math.min(state.w, state.h) * 0.06;
+
+      // Outer glow
+      ctx.globalAlpha = 0.14;
+      ctx.fillStyle = '#dbe7ff';
+      ctx.beginPath();
+      ctx.arc(mx, my, mr * 2.6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Soft halo
+      ctx.globalAlpha = 0.20;
+      ctx.beginPath();
+      ctx.arc(mx, my, mr * 1.9, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Core
+      ctx.globalAlpha = 0.78;
+      ctx.beginPath();
+      ctx.arc(mx, my, mr * 1.05, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Crescent cut
+      ctx.globalAlpha = 0.78;
+      ctx.fillStyle = '#0a1637';
+      ctx.beginPath();
+      ctx.arc(mx + mr * 0.35, my - mr * 0.1, mr * 0.98, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // Distant haze near horizon
+      ctx.globalAlpha = 0.18;
+      ctx.fillStyle = '#b7c7ff';
+      ctx.fillRect(0, state.h * 0.56, state.w, state.h * 0.18);
+      ctx.globalAlpha = 1;
+    }
+
+    function drawHills() {
+      const base = state.h * 0.70;
+
+      ctx.globalAlpha = 0.22;
+      ctx.fillStyle = '#20345f';
+      ctx.beginPath();
+      ctx.moveTo(0, base + 40);
+      for (let x = 0; x <= state.w; x += 36) {
+        const y = base + Math.sin(x * 0.008 + 1.0) * 18 + Math.sin(x * 0.02 + 2.2) * 9;
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(state.w, state.h);
+      ctx.lineTo(0, state.h);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.globalAlpha = 0.16;
+      ctx.fillStyle = '#1b2a4c';
+      ctx.beginPath();
+      ctx.moveTo(0, base + 100);
+      for (let x = 0; x <= state.w; x += 44) {
+        const y = base + 96 + Math.sin(x * 0.006 + 0.7) * 22 + Math.sin(x * 0.015 + 2.9) * 10;
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(state.w, state.h);
+      ctx.lineTo(0, state.h);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.globalAlpha = 1;
+
+      // Small cabin glow (distant)
+      const cx = state.w * 0.12;
+      const cy = state.h * 0.64;
+      ctx.globalAlpha = 0.12;
+      ctx.fillStyle = '#ffb000';
+      ctx.beginPath();
+      ctx.arc(cx + 8, cy + 8, 60, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.42;
+      ctx.fillStyle = '#141821';
+      ctx.fillRect(cx, cy, 42, 22);
+      ctx.beginPath();
+      ctx.moveTo(cx - 2, cy);
+      ctx.lineTo(cx + 21, cy - 14);
+      ctx.lineTo(cx + 46, cy);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = '#ffd60a';
+      ctx.fillRect(cx + 6, cy + 8, 8, 8);
+      ctx.fillRect(cx + 20, cy + 8, 8, 8);
+      ctx.globalAlpha = 1;
+    }
+
+    function drawGarland() {
+      if (!CONFIG.christmasLights) return;
+
+      const y0 = 42;
+      const amp = 18;
+      const step = 38;
+
+      // Wire
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = '#1c2233';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(0, y0);
+      for (let x = 0; x <= state.w; x += 16) {
+        const y = y0 + Math.sin((x / state.w) * Math.PI * 2) * amp;
+        ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // Bulbs
+      const colors = ['#ff3b3b', '#31d158', '#ffd60a', '#64d2ff', '#ffffff'];
+      for (let x = 12; x <= state.w - 12; x += step) {
+        const y = y0 + Math.sin((x / state.w) * Math.PI * 2) * amp;
+        const c = colors[(x / step) % colors.length | 0];
+        const tw = 0.55 + 0.45 * Math.sin(state.t * 2.4 + x * 0.03);
+
+        // Glow
+        ctx.globalAlpha = 0.08 + 0.12 * tw;
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(x, y, 11, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Core
+        ctx.globalAlpha = 0.65 + 0.25 * tw;
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(x, y, 3.8, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Small cap
+        ctx.globalAlpha = 0.45;
+        ctx.fillStyle = '#1c2233';
+        ctx.fillRect(x - 2, y - 7, 4, 3);
+      }
+
+      ctx.globalAlpha = 1;
+    }
+
+    function drawTree(tree) {
+      const { x, baseY, height, spread, tilt, depth, seed, kind } = tree;
+
+      const alpha = lerp(0.22, 0.86, 1 - depth);
+      const trunk = lerp(7, 16, 1 - depth) * rand(0.92, 1.08);
+      const dark = lerp(32, 12, 1 - depth);
+
+      const topX = x + tilt * height;
+      const topY = baseY - height;
+
+      // Trunk
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = `rgb(${dark},${dark + 6},${dark + 10})`;
+      ctx.lineWidth = trunk;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x, baseY);
+      ctx.lineTo(topX, topY);
+      ctx.stroke();
+
+      // Evergreen silhouette for Christmas vibe
+      if (kind === 'pine') {
+        const tiers = Math.floor(lerp(9, 6, depth));
+        ctx.globalAlpha = alpha * 0.75;
+        ctx.fillStyle = `rgb(${Math.floor(dark * 0.6)},${Math.floor(dark * 0.9)},${Math.floor(dark * 0.7)})`;
+        for (let i = 0; i < tiers; i++) {
+          const t = i / Math.max(1, tiers - 1);
+          const cy = lerp(baseY - height * 0.18, topY + height * 0.12, t);
+          const hw = lerp(spread, spread * 0.25, t);
+          const hx = lerp(x, topX, (baseY - cy) / height);
+          ctx.beginPath();
+          ctx.moveTo(hx, cy - 10);
+          ctx.lineTo(hx - hw, cy + 26);
+          ctx.lineTo(hx + hw, cy + 26);
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        // Snow cap highlight
+        ctx.globalAlpha = alpha * 0.18;
+        ctx.strokeStyle = '#dbe7ff';
+        ctx.lineWidth = Math.max(1.2, trunk * 0.18);
+        ctx.beginPath();
+        ctx.moveTo(x + trunk * 0.05, baseY - height * 0.1);
+        ctx.lineTo(topX + trunk * 0.06, topY + height * 0.08);
+        ctx.stroke();
+      } else {
+        // Bare branches (background variety)
+        const branchCount = Math.floor(lerp(12, 7, depth));
+        const rng = mulberry32(Math.floor(seed * 1e6));
+        for (let i = 0; i < branchCount; i++) {
+          const t = rng() * 0.95;
+          const by = lerp(baseY - height * 0.2, baseY - height * 0.95, t);
+          const bx = lerp(x, topX, (baseY - by) / height);
+          const dir = (rng() < 0.5 ? -1 : 1);
+          const len = lerp(spread, spread * 0.35, t) * lerp(0.9, 1.15, rng());
+          const ang = lerp(0.25, 0.75, 1 - t) * dir;
+
+          ctx.lineWidth = Math.max(1.1, trunk * lerp(0.34, 0.10, t));
+          ctx.beginPath();
+          ctx.moveTo(bx, by);
+          ctx.lineTo(bx + Math.cos(ang) * len, by - Math.sin(ang) * len * 0.55);
+          ctx.stroke();
+        }
+      }
+
+      // Tiny lights on near pines
+      if (CONFIG.christmasLights && kind === 'pine' && depth < 0.48 && Math.random() < 0.008) {
+        // Rarely add a sparkle point for variation
+        const lx = lerp(x, topX, rand(0.2, 0.9)) + rand(-spread * 0.15, spread * 0.15);
+        const ly = baseY - rand(height * 0.25, height * 0.85);
+        const palette = ['#ff3b3b', '#31d158', '#ffd60a', '#64d2ff'];
+        const color = palette[(Math.random() * palette.length) | 0];
+        state.fairy.push({ x: lx, y: ly, depth, r: rand(0.7, 1.8), tw: rand(0, Math.PI * 2), sp: rand(1.0, 2.5), color, intensity: 0.75 });
+      }
+
+      ctx.globalAlpha = 1;
+    }
+
+    function drawFairyLights() {
+      if (!CONFIG.christmasLights) return;
+      for (const l of state.fairy) {
+        const tw = 0.55 + 0.45 * Math.sin(state.t * l.sp + l.tw);
+        const a = l.intensity * (0.35 + 0.65 * tw);
+
+        // Glow
+        ctx.globalAlpha = a * 0.22;
+        ctx.fillStyle = l.color;
+        ctx.beginPath();
+        ctx.arc(l.x, l.y, l.r * 3.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Core
+        ctx.globalAlpha = a;
+        ctx.fillStyle = l.color;
+        ctx.beginPath();
+        ctx.arc(l.x, l.y, l.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    function drawGroundSnow() {
+      const bins = state.snowBins;
+      const bs = CONFIG.groundBinSize;
+
+      // Snow body
+      ctx.fillStyle = '#eef5ff';
+      ctx.globalAlpha = 0.99;
+
+      ctx.beginPath();
+      ctx.moveTo(0, state.h);
+      ctx.lineTo(0, state.groundY - bins[0]);
+      for (let i = 1; i < bins.length; i++) {
+        const x = i * bs;
+        const y = state.groundY - bins[i];
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(state.w, state.h);
+      ctx.closePath();
+      ctx.fill();
+
+      // Top highlight
+      ctx.globalAlpha = 0.34;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(0, state.groundY - bins[0]);
+      for (let i = 1; i < bins.length; i++) {
+        const x = i * bs;
+        const y = state.groundY - bins[i];
+        ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // Warm reflected glow near ground (Christmas ambience)
+      if (CONFIG.christmasLights) {
+        ctx.globalAlpha = 0.07;
+        ctx.fillStyle = '#ffb000';
+        ctx.fillRect(0, state.groundY - 70, state.w, 120);
+      }
+
+      ctx.globalAlpha = 1;
+    }
+
+    function drawFlakes() {
+      // Draw far to near
+      const flakes = state.flakes;
+
+      for (let pass = 0; pass < 3; pass++) {
+        for (let i = 0; i < flakes.length; i++) {
+          const f = flakes[i];
+          const layer = f.depth < 0.34 ? 2 : (f.depth < 0.67 ? 1 : 0);
+          if (layer !== pass) continue;
+
+          const a = lerp(0.18, 0.9, 1 - f.depth);
+          ctx.globalAlpha = a;
+          ctx.fillStyle = '#ffffff';
+
+          ctx.beginPath();
+          ctx.arc(f.x, f.y, f.size, 0, Math.PI * 2);
+          ctx.fill();
+
+          // Soft halo for near flakes
+          if (f.depth < 0.45) {
+            ctx.globalAlpha = a * 0.18;
+            ctx.beginPath();
+            ctx.arc(f.x + f.size * 0.45, f.y + f.size * 0.35, f.size * 1.9, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
+
+      ctx.globalAlpha = 1;
+    }
+
+    function drawSparks() {
+      for (const p of state.sparks) {
+        const t = clamp(1 - p.age / p.life, 0, 1);
+        ctx.globalAlpha = 0.35 * t;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * 3.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.globalAlpha = 0.85 * t;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    function drawSleighTrail() {
+      const tr = state.sleighTrail;
+      if (!tr || tr.length < 2) return;
+
+      // Draw segment-by-segment so the tail fades out
+      for (let i = 1; i < tr.length; i++) {
+        const p0 = tr[i - 1];
+        const p1 = tr[i];
+        const age = state.t - p0.t;
+        const a = clamp(1 - age / 1.25, 0, 1);
+
+        // Soft glow
+        ctx.globalAlpha = 0.10 * a;
+        ctx.strokeStyle = '#ffd60a';
+        ctx.lineWidth = 14 * a + 2;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+
+        // Inner streak
+        ctx.globalAlpha = 0.14 * a;
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 5 * a + 1;
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+
+        // Festive accent
+        ctx.globalAlpha = 0.06 * a;
+        ctx.strokeStyle = '#ff3b3b';
+        ctx.lineWidth = 3 * a + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y + 1);
+        ctx.lineTo(p1.x, p1.y + 1);
+        ctx.stroke();
+      }
+
+      ctx.globalAlpha = 1;
+    }
+
+    function drawSleigh() {
+      const s = state.sleigh;
+      if (!s) return;
+
+      // Simple silhouette: reindeer chain + sleigh
+      const scale = 1.0;
+      const x = s.x;
+      const y = s.y;
+
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = '#0b0f1c';
+
+      // Reindeer (4)
+      for (let i = 0; i < 4; i++) {
+        const rx = x - s.dir * (50 + i * 26);
+        const ry = y + Math.sin(s.t * 3.0 + i) * 2;
+
+        // Body
+        ctx.beginPath();
+        ctx.ellipse(rx, ry, 8 * scale, 4 * scale, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Head
+        const hx = rx + s.dir * 9;
+        const hy = ry - 2;
+        ctx.beginPath();
+        ctx.ellipse(hx, hy, 3.2 * scale, 2.6 * scale, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Bells (gold dots under the harness)
+        ctx.globalAlpha = 0.48;
+        ctx.fillStyle = '#ffd60a';
+        ctx.beginPath();
+        ctx.arc(rx - s.dir * 2, ry + 6, 2.0, 0, Math.PI * 2);
+        ctx.arc(rx + s.dir * 2, ry + 6, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Red nose on the lead reindeer (front-most)
+        if (i === 3) {
+          ctx.globalAlpha = 0.12;
+          ctx.fillStyle = '#ff3b3b';
+          ctx.beginPath();
+          ctx.arc(hx + s.dir * 3.6, hy, 7, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 0.92;
+          ctx.beginPath();
+          ctx.arc(hx + s.dir * 3.6, hy, 2.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // Back to silhouette style
+        ctx.globalAlpha = 0.55;
+        ctx.fillStyle = '#0b0f1c';
+
+        // Legs hint
+        ctx.globalAlpha = 0.42;
+        ctx.fillRect(rx - 2, ry + 3, 1.5, 7);
+        ctx.fillRect(rx + 2, ry + 3, 1.5, 7);
+        ctx.globalAlpha = 0.55;
+      }
+
+      // Rope line
+      ctx.globalAlpha = 0.28;
+      ctx.strokeStyle = '#0b0f1c';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x - s.dir * 60, y);
+      ctx.lineTo(x - s.dir * 12, y + 6);
+      ctx.stroke();
+
+      // Sleigh body (red) + gold accents
+      ctx.globalAlpha = 0.78;
+      ctx.fillStyle = '#7a0b1d';
+      ctx.beginPath();
+      ctx.roundRect(x, y - 10, 40, 18, 6);
+      ctx.fill();
+
+      // Seat
+      ctx.beginPath();
+      ctx.roundRect(x + 18, y - 22, 18, 12, 5);
+      ctx.fill();
+
+      // Gold stripe
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = '#c9a227';
+      ctx.fillRect(x + 6, y - 3, 28, 2.5);
+
+      // Runner (gold)
+      ctx.globalAlpha = 0.75;
+      ctx.strokeStyle = '#c9a227';
+      ctx.lineWidth = 3.2;
+      ctx.beginPath();
+      ctx.moveTo(x + 2, y + 9);
+      ctx.quadraticCurveTo(x + 18, y + 16, x + 38, y + 10);
+      ctx.stroke();
+
+      // Little bell on sleigh
+      ctx.globalAlpha = 0.62;
+      ctx.fillStyle = '#ffd60a';
+      ctx.beginPath();
+      ctx.arc(x + 8, y - 11, 2.4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Subtle glow (magic feel)
+      ctx.globalAlpha = 0.14;
+      ctx.fillStyle = '#ffd60a';
+      ctx.beginPath();
+      ctx.arc(x + 18, y - 2, 52, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.06;
+      ctx.fillStyle = '#64d2ff';
+      ctx.beginPath();
+      ctx.arc(x + 18, y - 2, 70, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.globalAlpha = 1;
+    }
+
+    function vignette() {
+      const g = ctx.createRadialGradient(
+        state.w * 0.5,
+        state.h * 0.52,
+        state.h * 0.22,
+        state.w * 0.5,
+        state.h * 0.52,
+        state.h * 0.82
+      );
+      g.addColorStop(0, 'rgba(0,0,0,0)');
+      g.addColorStop(1, 'rgba(0,0,0,0.6)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, state.w, state.h);
+    }
+
+    function render() {
+      drawSky();
+      drawGarland();
+      drawHills();
+
+      // Trees
+      for (const tree of state.trees) drawTree(tree);
+
+      // Distant lights
+      drawFairyLights();
+
+      // Snow and particles
+      drawGroundSnow();
+      drawSleighTrail();
+      drawSleigh();
+      drawSparks();
+      drawFlakes();
+
+      vignette();
+    }
+
+    function frame(now) {
+      if (!running) return;
+
+      const dt = Math.min(0.05, (now - state.last) / 1000);
+      state.last = now;
+      state.t += dt;
+
+      update(dt);
+      render();
+
+      requestAnimationFrame(frame);
+    }
+
+    function mulberry32(a) {
+      // Small deterministic PRNG
+      return function() {
+        let t = (a += 0x6D2B79F5);
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    // UX
+    window.addEventListener('click', () => {
+      state.hintVisible = !state.hintVisible;
+      hint.classList.toggle('hidden', !state.hintVisible);
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') running = false;
+      if (e.key === 'l' || e.key === 'L') CONFIG.christmasLights = !CONFIG.christmasLights;
+      if (e.key === 's' || e.key === 'S') CONFIG.sleighEnabled = !CONFIG.sleighEnabled;
+      if (e.key === 'r' || e.key === 'R') resetSnow();
+    });
+
+    window.addEventListener('resize', resize);
+
+    // Init
+    resize();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>

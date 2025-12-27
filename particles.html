@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Particle System (OGL)</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #111;
+            font-family: 'Segoe UI', sans-serif;
+        }
+
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            cursor: grab;
+        }
+
+        #canvas-container:active {
+            cursor: grabbing;
+        }
+
+        /* UI 層 */
+        .ui-layer {
+            position: absolute;
+            bottom: 30px;
+            left: 30px;
+            z-index: 10;
+            color: #fff;
+            pointer-events: none;
+            mix-blend-mode: exclusion;
+        }
+
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+
+        .control-item {
+            display: flex;
+            align-items: center;
+        }
+
+        .key { 
+            border: 1px solid rgba(255,255,255,0.6); 
+            padding: 4px 8px; 
+            border-radius: 4px; 
+            font-weight: 600;
+            background: rgba(255,255,255,0.1);
+            margin-right: 8px;
+            min-width: 24px;
+            display: inline-block;
+            text-align: center;
+        }
+
+        /* 錯誤訊息提示 */
+        #error-banner {
+            display: none; /* 預設隱藏 */
+            position: fixed; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            background: #ff4d4f; 
+            color: white;
+            padding: 10px; 
+            text-align: center; 
+            z-index: 999;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 錯誤訊息容器 -->
+    <div id="error-banner"></div>
+
+    <!-- WebGL 容器 -->
+    <div id="canvas-container"></div>
+
+    <!-- UI 操作說明 -->
+    <div class="ui-layer">
+      <div class="controls">
+        <div class="control-item"><span class="key">Drag</span> 旋轉視角 (Rotate Object)</div>
+        <div class="control-item"><span class="key">↑ ↓</span> 前進/後退 (Move Forward/Back)</div>
+        <div class="control-item"><span class="key">← →</span> 左右轉頭 (Look Left/Right)</div>
+      </div>
+    </div>
+
+    <!-- 主要邏輯 -->
+    <script type="module">
+        // 直接從 CDN 引入 OGL
+        import { Renderer, Camera, Geometry, Program, Mesh } from 'https://esm.sh/ogl@1.0.11';
+
+        // === 變數宣告 ===
+        const container = document.getElementById('canvas-container');
+        const errorBanner = document.getElementById('error-banner');
+        
+        let renderer, gl, camera, particles, program;
+        let time = 0;
+        let animationId;
+
+        // 互動狀態
+        let isDragging = false;
+        let lastMouse = { x: 0, y: 0 };
+        let rotation = { x: 0, y: 0 };
+        const activeKeys = {};
+        const numParticles = 2000;
+
+        // === 初始化函數 ===
+        async function init() {
+            try {
+                // 1. Setup Renderer
+                renderer = new Renderer({ 
+                    depth: false, 
+                    dpr: Math.min(window.devicePixelRatio, 2) 
+                });
+                gl = renderer.gl;
+                gl.clearColor(0.06, 0.06, 0.06, 1);
+                
+                container.appendChild(gl.canvas);
+
+                // 2. Setup Camera
+                camera = new Camera(gl, { fov: 15 });
+                camera.position.z = 15;
+
+                // 3. Create Particles
+                createParticles();
+
+                // 4. Events & Loop
+                addEventListeners();
+                resize();
+                animate();
+
+            } catch (err) {
+                console.error('Failed to init OGL:', err);
+                showError('無法載入 WebGL 或 OGL 函式庫，請檢查網路連線。');
+            }
+        }
+
+        // === 建立粒子系統 ===
+        function createParticles() {
+            const vertex = /* glsl */ `
+                attribute vec3 position;
+                attribute vec4 random;
+                attribute vec3 color;
+
+                uniform mat4 modelMatrix;
+                uniform mat4 viewMatrix;
+                uniform mat4 projectionMatrix;
+                uniform float uTime;
+
+                varying vec4 vRandom;
+                varying vec3 vColor;
+
+                void main() {
+                    vRandom = random;
+                    vColor = color;
+
+                    vec3 pos = position * 2.0 - 1.0;
+                    pos.z *= 10.0;
+
+                    vec4 mPos = modelMatrix * vec4(pos, 1.0);
+
+                    float t = uTime * 0.6;
+                    // 粒子波動邏輯
+                    mPos.x += sin(t * random.z + 6.28 * random.w) * mix(0.1, 1.5, random.x);
+                    mPos.y += sin(t * random.y + 6.28 * random.x) * mix(0.1, 1.5, random.w);
+                    mPos.z += sin(t * random.w + 6.28 * random.y) * mix(0.1, 1.5, random.z);
+
+                    vec4 mvPos = viewMatrix * mPos;
+                    // 根據距離調整點的大小
+                    gl_PointSize = 300.0 / length(mvPos.xyz) * (random.x + 0.1);
+                    gl_Position = projectionMatrix * mvPos;
+                }
+            `;
+
+            const fragment = /* glsl */ `
+                precision highp float;
+                uniform float uTime;
+                varying vec4 vRandom;
+                varying vec3 vColor;
+
+                void main() {
+                    vec2 uv = gl_PointCoord.xy;
+                    // 圓形遮罩
+                    float circle = smoothstep(0.5, 0.4, length(uv - 0.5)) * 0.8;
+                    // 顏色閃爍
+                    vec3 finalColor = vColor + 0.1 * sin(uTime + vRandom.y * 6.28);
+                    
+                    gl_FragColor.rgb = finalColor;
+                    gl_FragColor.a = circle;
+                }
+            `;
+
+            // 準備數據 buffer
+            const position = new Float32Array(numParticles * 3);
+            const random = new Float32Array(numParticles * 4);
+            const color = new Float32Array(numParticles * 3);
+
+            for (let i = 0; i < numParticles; i++) {
+                position.set([Math.random(), Math.random(), Math.random()], i * 3);
+                random.set([Math.random(), Math.random(), Math.random(), Math.random()], i * 4);
+                
+                const r = Math.random();
+                const g = Math.random();
+                const b = Math.random();
+                color.set([r, g, b], i * 3);
+            }
+
+            const geometry = new Geometry(gl, {
+                position: { size: 3, data: position },
+                random: { size: 4, data: random },
+                color: { size: 3, data: color },
+            });
+
+            program = new Program(gl, {
+                vertex,
+                fragment,
+                uniforms: { uTime: { value: 0 } },
+                transparent: true,
+                depthTest: false,
+            });
+
+            particles = new Mesh(gl, { mode: gl.POINTS, geometry, program });
+        }
+
+        // === 動畫迴圈 ===
+        function animate() {
+            animationId = requestAnimationFrame(animate);
+            
+            time += 0.005;
+            if (program) {
+                program.uniforms.uTime.value = time;
+            }
+
+            updateCameraMovement();
+
+            renderer.render({ scene: particles, camera: camera });
+        }
+
+        // === 相機移動邏輯 (First Person) ===
+        function updateCameraMovement() {
+            if (!camera) return;
+
+            const moveSpeed = 0.3;
+            const rotSpeed = 0.03;
+
+            // 1. 左右轉頭 (鍵盤)
+            if (activeKeys['ArrowLeft']) camera.rotation.y += rotSpeed;
+            if (activeKeys['ArrowRight']) camera.rotation.y -= rotSpeed;
+
+            // 2. 前後移動 (根據當前朝向)
+            if (activeKeys['ArrowUp'] || activeKeys['ArrowDown']) {
+                const dir = activeKeys['ArrowUp'] ? 1 : -1;
+                const rotY = camera.rotation.y;
+                
+                camera.position.x -= Math.sin(rotY) * moveSpeed * dir;
+                camera.position.z -= Math.cos(rotY) * moveSpeed * dir;
+            }
+        }
+
+        // === 事件監聽 ===
+        function addEventListeners() {
+            // Resize
+            window.addEventListener('resize', resize, false);
+
+            // Mouse Events
+            container.addEventListener('mousedown', (e) => {
+                isDragging = true;
+                lastMouse = { x: e.clientX, y: e.clientY };
+            });
+
+            window.addEventListener('mouseup', () => {
+                isDragging = false;
+            });
+
+            window.addEventListener('mousemove', (e) => {
+                if (!isDragging || !particles) return;
+
+                const deltaX = e.clientX - lastMouse.x;
+                const deltaY = e.clientY - lastMouse.y;
+
+                rotation.y += deltaX * 0.005;
+                rotation.x += deltaY * 0.005;
+
+                particles.rotation.y = rotation.y;
+                particles.rotation.x = rotation.x;
+
+                lastMouse = { x: e.clientX, y: e.clientY };
+            });
+
+            // Keyboard Events
+            window.addEventListener('keydown', (e) => {
+                activeKeys[e.key] = true;
+            });
+
+            window.addEventListener('keyup', (e) => {
+                activeKeys[e.key] = false;
+            });
+        }
+
+        function resize() {
+            if (!renderer) return;
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            camera.perspective({ aspect: gl.canvas.width / gl.canvas.height });
+        }
+
+        function showError(msg) {
+            if (errorBanner) {
+                errorBanner.textContent = msg;
+                errorBanner.style.display = 'block';
+            }
+        }
+
+        // 啟動
+        init();
+
+    </script>
+</body>
+</html>
